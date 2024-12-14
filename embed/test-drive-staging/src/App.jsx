@@ -7,7 +7,7 @@ function App() {
   useEffect(() => {
     let isMounted = true; // Track if the component is still mounted
     console.log('Fetching...')
-    fetch('http://localhost:3000/URL')
+    fetch('http://ec2-18-117-74-231.us-east-2.compute.amazonaws.com:3000/URL')
       .then(response => response.json()) // Assuming the response is JSON
       .then(data => {
         if (isMounted) {

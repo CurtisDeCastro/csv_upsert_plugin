@@ -38,4 +38,3 @@ export async function generateSignedUrl() {
         throw new Error("JWT generation failed");
     }
 }
-

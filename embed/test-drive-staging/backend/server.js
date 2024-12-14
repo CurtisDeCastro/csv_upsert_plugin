@@ -21,6 +21,7 @@ app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
 app.get('/URL', async (req, res) => {
+    console.log(req.body);
     try {
         if (!process.env.SECRET) {
             throw new Error('SECRET environment variable is not set');
