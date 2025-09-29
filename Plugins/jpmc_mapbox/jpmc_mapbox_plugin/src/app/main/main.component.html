@@ -1,0 +1,47 @@
+<div class="flex flex-column h-full w-full" style="position: absolute">
+    <!-- floating icon in top left -->
+    <div class="mainmenu-icon">
+        <i class="pi pi-bars" style="font-size: 0.8rem" (click)="toggleMainMenu()"></i>
+    </div>
+
+    <app-main-menu (layerSelectorClick)="onLayerSelectorClick($event)"></app-main-menu>
+    
+    <div #mapContainer class='map-container'></div>
+    @if (legendVisible) {
+        <div class="legend-container">
+            <div [innerHTML]="lastLegendData"></div>
+        </div>
+    }
+    
+    <p-popover #layerSelectorPopover [style]="{'margin-top': '44px', 'margin-left': '-14px'}">
+        <div class="p-3" style="min-width: 250px;">
+            @if (addedLayers.length > 0) {
+                <div class="flex flex-column gap-2">
+                    @for (layer of addedLayers; track layer.key) {
+                        <div class="flex align-items-center gap-2">
+                            <p-checkbox
+                                [ngModel]="layer.visible"
+                                (ngModelChange)="toggleLayerVisibility(layer.key)"
+                                [binary]="true">
+                            </p-checkbox>
+                            <label class="text-sm">{{ layer.title }}</label>
+                        </div>
+                    }
+                </div>
+            } @else {
+                <p class="text-sm text-500">No layers available</p>
+            }
+        </div>
+    </p-popover>
+
+    <div id="tooltipContainer"
+         [style.left.px]="tooltipX"
+         [style.top.px]="tooltipY"
+         [style.pointer-events]="'none'"
+         class="tooltip-overlay">
+        @if (tooltipVisible) {
+            <app-tooltip [feature]="tooltipFeature"></app-tooltip>
+        }
+    </div>
+
+</div>
