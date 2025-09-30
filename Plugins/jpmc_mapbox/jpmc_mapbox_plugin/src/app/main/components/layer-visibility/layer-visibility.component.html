@@ -1,0 +1,14 @@
+<div class="flex flex-column gap-2" *ngIf="layers?.length; else emptyState">
+  <div class="flex align-items-center gap-2" *ngFor="let layer of layers; trackBy: trackLayer">
+    <p-checkbox
+      [ngModel]="layer.visible"
+      (ngModelChange)="onToggle(layer)"
+      [binary]="true">
+    </p-checkbox>
+    <label class="text-sm">{{ layer.title }}</label>
+  </div>
+</div>
+
+<ng-template #emptyState>
+  <p class="text-sm text-500">No layers available</p>
+</ng-template>

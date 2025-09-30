@@ -1,6 +1,5 @@
 import { Component, ElementRef, OnDestroy, OnInit, AfterViewInit, ViewChild, inject } from '@angular/core';
 import { isPlatformBrowser, CommonModule } from '@angular/common';
-import { FormsModule } from '@angular/forms';
 import { PLATFORM_ID } from '@angular/core';
 import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
 
@@ -10,27 +9,32 @@ import { switchMap, tap } from 'rxjs/operators';
 import { client, WorkbookElementData } from '@sigmacomputing/plugin';
 
 import { PopoverModule } from 'primeng/popover';
-import { CheckboxModule } from 'primeng/checkbox';
 
 import { ConfigService } from '../services/core/config.service';
 import { ElementDataService } from '../services/core/element-data.service';
-import { VariableService } from '../services/core/variable.service';
-import { GetGeoJsonsService } from '../services/plugin/get-geojsons.service';
 import { GetLegendService } from '../services/plugin/get-legend.service';
 import { UiStateService } from '../services/plugin/ui-state.service';
 
 import { MainMenuComponent } from './menu/main-menu.component';
 import { TooltipComponent } from './tooltip/tooltip.component';
+import { LayerVisibilityComponent } from './components/layer-visibility/layer-visibility.component';
+import { LegendDisplayComponent } from './components/legend-display/legend-display.component';
+import { MapService } from './services/map.service';
+import { MapInteractionCallbacks, MapLayer } from './models/map-layer.model';
 
 @Component({
     selector: 'app-main',
     templateUrl: './main.component.html',
     styleUrls: ['./main.component.css'],
     standalone: true,
-    imports: [CommonModule, FormsModule, PopoverModule, CheckboxModule, MainMenuComponent, TooltipComponent]
+    imports: [CommonModule, PopoverModule, MainMenuComponent, TooltipComponent, LayerVisibilityComponent, LegendDisplayComponent]
 })
 
 export class MainComponent implements OnInit, AfterViewInit, OnDestroy {
+
+    // Acts as a thin Angular wrapper around a Mapbox GL map. All of the heavy
+    // lifting happens in Mapbox; Angular just gives us structured lifecycle hooks
+    // and access to Sigma's plugin services.
 
     @ViewChild('mapContainer', { static: true }) mapContainer!: ElementRef;
     @ViewChild('layerSelectorPopover') layerSelectorPopover: any;
@@ -38,18 +42,11 @@ export class MainComponent implements OnInit, AfterViewInit, OnDestroy {
 
     private subscriptions: Subscription[] = [];
 
-    private map: any;
-
-    private layerIds: { [key: string]: string } = {};
-    private layerCreationInProgress: { [key: string]: boolean } = {};
-
-    private lastGeoJsonsData: any;
     private lastLegendDataString: string = '';
     lastLegendData: SafeHtml = '';
-    private activeDashedLayerIds: string[] = [];
-    
+
     // array to track layers added to the map
-    public addedLayers: { key: string; title: string; visible: boolean; ids: string[] }[] = [];
+    public addedLayers: MapLayer[] = [];
 
     private basemapUrl: string = 'mapbox://styles/psoral/cme3ei4xl000701rad5l8c6b4';
 
@@ -68,8 +65,17 @@ export class MainComponent implements OnInit, AfterViewInit, OnDestroy {
     private pointType3: string = 'Circle';
     private pointType4: string = 'Circle';
 
-    private selectedFeature: any = null;
-    private layersWithClickHandlers: Set<string> = new Set();
+    // Mapbox clustering defaults to OFF; authors can enable it from the global toggle.
+    private _clusterPoints: boolean = false;
+    private get clusterPoints(): boolean {
+        return this._clusterPoints;
+    }
+    private set clusterPoints(value: boolean) {
+        if (this._clusterPoints !== value) {
+            this._clusterPoints = value;
+            console.log('[Map] clusterPoints changed:', value);
+        }
+    }
 
     private layer1Title: string = 'Layer 1';
     private layer2Title: string = 'Layer 2';
@@ -82,29 +88,8 @@ export class MainComponent implements OnInit, AfterViewInit, OnDestroy {
     public tooltipX: number = 0;
     public tooltipY: number = 0;
 
-    private elementDataSubscription: Subscription | null = null;
-
     config: any;
     elementData: WorkbookElementData = {};
-
-    dashArraySequence = [
-        [0, 4, 3],
-        [0.5, 4, 2.5],
-        [1, 4, 2],
-        [1.5, 4, 1.5],
-        [2, 4, 1],
-        [2.5, 4, 0.5],
-        [3, 4, 0],
-        [0, 0.5, 3, 3.5],
-        [0, 1, 3, 3],
-        [0, 1.5, 3, 2.5],
-        [0, 2, 3, 2],
-        [0, 2.5, 3, 1.5],
-        [0, 3, 3, 1],
-        [0, 3.5, 3, 0.5]
-    ];
-
-    step = 0;
 
     private mainMenuVisible: boolean = false;
     legendVisible: boolean = false;
@@ -113,17 +98,21 @@ export class MainComponent implements OnInit, AfterViewInit, OnDestroy {
     constructor(
         private configService: ConfigService,
         private elementDataService: ElementDataService,
-        private variableService: VariableService,
-        private getGeoJsonsService: GetGeoJsonsService,
         private getLegendService: GetLegendService,
         private uiStateService: UiStateService,
-        private sanitizer: DomSanitizer
-    ) {}
+        private sanitizer: DomSanitizer,
+        private mapService: MapService
+    ) {
+        this.addedLayers = this.mapService.getTrackedLayers();
+    }
 
     async ngOnInit() {
 
+        // Configure Sigma's editor sidebar. Everything defined here becomes a toggle
+        // or dropdown that authors can use to control the map from inside Sigma.
         client.config.configureEditorPanel([
             { name: 'basemapUrl', type: 'text', label: 'Basemap URL' },
+            { type: 'toggle', name: 'clusterPoints', label: 'Cluster Points', defaultValue: false },
 
             { name: 'layer1', type: 'element' },
             { name: 'layer1Geometry', type: 'column', source: 'layer1', allowMultiple: false, label: 'Geometry' },
@@ -247,355 +236,42 @@ export class MainComponent implements OnInit, AfterViewInit, OnDestroy {
         this.tooltipFeature = null;
     };
 
-    private setupClickHandler(layerId: string): void {
-
-        // check if we already set up a click handler for this layer
-        if (this.layersWithClickHandlers.has(layerId)) {
-            return;
-        }
-
-        if (this.map.getLayer(layerId)) {
-            
-            // in the future, if we want to add an interaction based on clicks, we can do it here
-            /*
-            this.map.on('click', layerId, (e: any) => {
-
-                if (e.features && e.features.length > 0) {
-                    const feature = e.features[0];
-                    
-                    // clear previous selection if it had an ID
-                    if (this.selectedFeature && this.selectedFeature.id !== undefined) {
-                        this.map.setFeatureState(this.selectedFeature, { selected: false });
-                    }
-    
-                    this.selectedFeature = feature;
-                    
-                    // only set feature state if the feature has an ID
-                    if (feature.id !== undefined) {
-                        this.map.setFeatureState(feature, { selected: true });
-                    }
-                    
-                    this.showTooltip(feature);
-                }
-            });
-            */
-
-            // change cursor on hover, show tooltip, set selected state of feature
-            this.map.on('mouseenter', layerId, (e: any) => {
-
-                this.map.getCanvas().style.cursor = 'pointer';
-                if (e.features && e.features.length > 0) {
-                    const feature = e.features[0];
-                    this.selectedFeature = feature;
-                    this.map.setFeatureState(feature, { selected: true });
-                    this.showTooltip(feature, e.point.x, e.point.y);
-                }
-            });
-
-            // update tooltip position on mouse move when tooltip is visible
-            this.map.on('mousemove', layerId, (e: any) => {
-                if (this.tooltipVisible) {
-                    this.updateTooltipPosition(e.point.x, e.point.y);
-                }
-            });
-
-            // remove pointer cursor, hide tooltip, remove selected state of feature
-            this.map.on('mouseleave', layerId, () => {
-                if (this.selectedFeature) {
-                    this.map.getCanvas().style.cursor = '';
-                    this.map.setFeatureState(this.selectedFeature, { selected: false });
-                    this.hideTooltip();
-                }
-            });
-
-            // mark this layer as having a click handler
-            // processLayerData and therefore setupClickHandler gets called multiple times
-            // we need to prevent the click handler from being added multiple times
-            this.layersWithClickHandlers.add(layerId);
-        }
-    }
-
     ngAfterViewInit() {
         this.tooltipContainer = document.getElementById('tooltipContainer');
     }
 
     // toggle layer visibility on the map
     public toggleLayerVisibility(layerKey: string): void {
-
-        if (!this.map) return;
-
-        // find the entry in addedLayers that matches the layerKey
-        // loop through all ids for the layerKey and toggle the visibility of each
-
-        const layer = this.addedLayers.find(l => l.key === layerKey);
-        if (!layer) return;
-
-        layer.ids.forEach(id => {
-
-            const currentVisibility = this.map.getLayoutProperty(id, 'visibility');
-
-            // isCurrentlyVisible will be true if mapbox returns visible or undefined
-            const isCurrentlyVisible = currentVisibility === 'visible' || currentVisibility === undefined;
-
-            // if isCurrentlyVisible is true, set layer visibility to none (hidden)
-            // if isCurrentlyVisible is false, set layer visibility to visible
-            const newVisibility = isCurrentlyVisible ? 'none' : 'visible';
-        
-            this.map.setLayoutProperty(id, 'visibility', newVisibility);
-            layer.visible = newVisibility === 'visible';
-        });
-
-    }
-
-    // public method to clear the tracked layers array
-    public clearTrackedLayers(): void {
-        this.addedLayers = [];
+        this.mapService.toggleLayerVisibility(layerKey);
     }
 
 
 
-    private processLayerData = (data: any, layerKey: string, layerTitle: string, animateLines: boolean, pointType: string, fillPolygons: boolean) => {
-            
-        // since multiple layers are involved, getData gets called for layer2 before layer1 has a chance to complete
-        // this check prevents layers from getting created multiple times
-        /* if (this.layerCreationInProgress[layerKey]) {
-            return;
-        } */
+    private processLayerData(
+        data: any,
+        layerKey: string,
+        layerTitle: string,
+        animateLines: boolean,
+        pointType: string,
+        fillPolygons: boolean,
+        clusterPoints: boolean
+    ) {
+        const callbacks: MapInteractionCallbacks = {
+            onHoverEnter: (feature, point) => this.showTooltip(feature, point.x, point.y),
+            onHoverMove: point => this.updateTooltipPosition(point.x, point.y),
+            onHoverLeave: () => this.hideTooltip()
+        };
 
-        if (data && Object.keys(data).length > 0) {
-
-            this.elementData = data;
-
-            // we have elementData, get geoJsons
-            return this.getGeoJsonsService.getGeoJsons(this.elementData).pipe(
-                tap((geoJsons: any[]) => {
-
-                    // check if geoJsons data has actually changed
-                    const geoJsonsDataString = JSON.stringify(geoJsons);
-                    if (geoJsonsDataString !== this.lastGeoJsonsData) {
-
-                        this.lastGeoJsonsData = geoJsonsDataString;
-
-                        // check if key already exists in addedLayers, if not add it
-                        let existingLayerInTracker = this.addedLayers.find(layer => layer.key === layerKey);
-                        if (!existingLayerInTracker) {
-                            this.addedLayers.push({
-                                key: layerKey,
-                                title: layerTitle,
-                                visible: true,
-                                ids: []
-                            });
-                            existingLayerInTracker = this.addedLayers[this.addedLayers.length - 1];
-                        }
-
-                        const lineSourceId = `line-${layerKey}`;
-                        const backgroundLayerId = `line-background-${layerKey}`;
-                        const dashedLayerId = `line-dashed-${layerKey}`;
-
-                        const pointSourceId = `point-${layerKey}`;
-                        const pointLayerId = `point-layer-${layerKey}`;
-
-                        const polygonFillLayerId = `polygon-fill-layer-${layerKey}`;
-
-                        const lineFeatureCollection = {
-                            type: 'FeatureCollection',
-                            features: []
-                        };
-
-                        const pointFeatureCollection = {
-                            type: 'FeatureCollection',
-                            features: []
-                        };
-
-                        const polygonFeatureCollection = {
-                            type: 'FeatureCollection',
-                            features: []
-                        };
-
-                        // process each FeatureCollection in the geoJsons array
-                        geoJsons.forEach((featureCollection, index) => {
-                            // skip null or undefined featureCollection objects
-                            if (!featureCollection) {
-                                return;
-                            }
-
-                            const features = featureCollection.features || [];
-
-                            // separate features by geometry type
-                            const lineFeatures = features.filter((feature: any) => 
-                                feature.geometry.type === 'LineString' || feature.geometry.type === 'MultiLineString' || feature.geometry.type === 'Polygon' || feature.geometry.type === 'MultiPolygon'
-                            );
-
-                            if (lineFeatures.length > 0) {
-
-                                lineFeatureCollection.features = lineFeatureCollection.features.concat(lineFeatures);
-
-                                // check if source exists and update or add accordingly
-                                const existingLineSource = this.map.getSource(lineSourceId);
-                                if (existingLineSource) {
-                                    // source exists, update its data
-                                    existingLineSource.setData(lineFeatureCollection);
-                                } else {
-                                    // source doesn't exist, add it
-                                    this.map.addSource(lineSourceId, {
-                                        'type': 'geojson',
-                                        'lineMetrics': true,
-                                        'data': lineFeatureCollection,
-                                        'generateId': true
-                                    });
-                                }
-
-                                // check if layers exist before adding them
-                                if (animateLines && !this.map.getLayer(backgroundLayerId)) {
-                                    // add background layer
-                                    this.map.addLayer({
-                                        type: 'line',
-                                        source: lineSourceId,
-                                        id: backgroundLayerId,
-                                        paint: {
-                                            'line-color': ['get','line-color'],
-                                            'line-width': ['coalesce', ['get', 'line-width'], 2],
-                                            'line-opacity': 0.4
-                                        }
-                                    });
-                                    existingLayerInTracker.ids.push(backgroundLayerId);
-                                }
-
-                                if (animateLines && !this.map.getLayer(dashedLayerId)) {
-                                    // add dashed layer for animation
-                                    this.map.addLayer({
-                                        type: 'line',
-                                        source: lineSourceId,
-                                        id: dashedLayerId,
-                                        paint: {
-                                            'line-color': ['get','line-color'],
-                                            'line-width': ['coalesce', ['get', 'line-width'], 2],
-                                            'line-dasharray': [0, 4, 3],
-                                            'line-emissive-strength': 1
-                                        }
-                                    });
-
-                                    // track this dashed layer for animation (only when first created)
-                                    this.activeDashedLayerIds.push(dashedLayerId);
-                                    existingLayerInTracker.ids.push(dashedLayerId);
-                                    
-                                }
-
-                                if (!animateLines && !this.map.getLayer(dashedLayerId)) {
-                                    this.map.addLayer({
-                                        type: 'line',
-                                        source: lineSourceId,
-                                        id: dashedLayerId,
-                                        paint: {
-                                            'line-color': ['get','line-color'],
-                                            'line-width': ['coalesce', ['get', 'line-width'], 2],
-                                            'line-emissive-strength': 1
-                                        }
-                                    });
-                                    existingLayerInTracker.ids.push(dashedLayerId);
-                                }
-
-                                if (fillPolygons && !this.map.getLayer(polygonFillLayerId)) {
-                                    // add fill layer for polygons
-                                    this.map.addLayer({
-                                        type: 'fill',
-                                        source: lineSourceId,
-                                        id: polygonFillLayerId,
-                                        paint: {
-                                            'fill-color': ['get','fill-color'],
-                                            'fill-opacity': ['coalesce', ['get', 'fill-opacity'], 0.4]
-                                        }
-                                    });
-
-                                    // track this dashed layer for animation (only when first created)
-                                    existingLayerInTracker.ids.push(polygonFillLayerId);
-                                    
-                                }
-                                
-                                this.setupClickHandler(dashedLayerId);
-
-                            }
-
-                            const pointFeatures = features.filter((feature: any) => 
-                                feature.geometry.type === 'Point' || feature.geometry.type === 'MultiPoint'
-                            );
-
-                            if (pointFeatures.length > 0) {
-
-                                pointFeatureCollection.features = pointFeatureCollection.features.concat(pointFeatures);
-
-                                // check if point source exists and update or add accordingly
-                                const existingPointSource = this.map.getSource(pointSourceId);
-                                if (existingPointSource) {
-                                    // source exists, update its data
-                                    existingPointSource.setData(pointFeatureCollection);
-                                } else {
-                                    // source doesn't exist, add it
-                                    this.map.addSource(pointSourceId, {
-                                        'type': 'geojson',
-                                        'data': pointFeatureCollection,
-                                        'generateId': true
-                                    });
-                                }
-
-                                // check if point layer exists before adding it
-                                if (!this.map.getLayer(pointLayerId) && pointType === 'Icon') {
-                                    // dynamically color svg icons
-                                    this.map.addLayer({
-                                        id: pointLayerId,
-                                        type: 'symbol',
-                                        source: pointSourceId,
-                                        layout: {
-                                            'icon-image': [
-                                                'image',
-                                                ['case',
-                                                    ['==', ['get', 'pin_type'], 'Factory'], 'Factory',
-                                                    ['==', ['get', 'pin_type'], 'Ship'], 'Ship',
-                                                    ['==', ['get', 'pin_type'], 'Anchor'], 'Anchor',
-                                                    ['==', ['get', 'pin_type'], 'User'], 'User',
-                                                    'flag'
-                                                ],
-                                                { params: { pin_color: ['get', 'pin_color'] } },
-                                            ],
-                                            'icon-anchor': 'bottom'
-                                        }
-                                    });
-                                    existingLayerInTracker.ids.push(pointLayerId);
-                                    
-                                }
-
-                                // check if point layer exists before adding it
-                                if (!this.map.getLayer(pointLayerId) && pointType === 'Circle') {
-                                    // dynamically color svg icons
-                                    this.map.addLayer({
-                                        id: pointLayerId,
-                                        type: 'circle',
-                                        source: pointSourceId,
-                                        paint: {
-                                            'circle-radius': ['coalesce', ['get', 'circle-radius'], 2],
-                                            'circle-color': ['coalesce', ['get', 'circle-color'], '#3d293d'],
-                                            'circle-stroke-width': ['coalesce', ['get', 'circle-stroke-width'], 1],
-                                            'circle-stroke-color': ['coalesce', ['get', 'circle-stroke-color'], '#3d293d'],
-                                            'circle-opacity': ['coalesce', ['get', 'circle-opacity'], 1]
-                                        }
-                                    });
-                                    existingLayerInTracker.ids.push(pointLayerId);
-                                }
-
-                                this.setupClickHandler(pointLayerId);
-
-                            }
-                            
-                        });
-
-                    }
-
-                })
-            );
-        }
-
-        // return empty observable if no data
-        return of([]);
+        return this.mapService.processLayerData(
+            data,
+            layerKey,
+            layerTitle,
+            animateLines,
+            pointType,
+            fillPolygons,
+            clusterPoints,
+            callbacks
+        );
     }
 
     private getConfig(): void {
@@ -630,6 +306,14 @@ export class MainComponent implements OnInit, AfterViewInit, OnDestroy {
             return;
         }
 
+        if (Object.prototype.hasOwnProperty.call(config, 'clusterPoints')) {
+            this.clusterPoints = this.toBoolean(config.clusterPoints, false);
+        }
+        this.subscriptions.forEach(subscription => subscription.unsubscribe());
+        this.subscriptions = [];
+        this.mapService.dispose();
+        this.addedLayers = this.mapService.getTrackedLayers();
+
         if (config.layer1 && config.animateLines1 !== undefined) {
             this.animateLines1 = config.animateLines1;
             this.pointType1 = config.pointType1;
@@ -658,40 +342,31 @@ export class MainComponent implements OnInit, AfterViewInit, OnDestroy {
             this.layer4Title = config.layer4Title || 'Layer 4';
         }
 
-        if (isPlatformBrowser(this.platformId)) { // SSR check to ensure this runs in the browser as GL JS requires a browser environment
-            const mapboxgl = (await import('mapbox-gl')).default // dynamically import mapbox-gl as the default export
-      
-            // create a new map instance
-            
-            this.map = new mapboxgl.Map({
-              accessToken: 'pk.eyJ1IjoicHNvcmFsIiwiYSI6ImNtZHJwOXJ1MjBpN2EybW9vYzFpMHE5a3UifQ.CGKehwJSuaC0L-cFW8_I2w',
-              container: this.mapContainer.nativeElement, // Reference to the map container element
-              style: this.basemapUrl,
-              center: [-98.54818, 40.00811], // Center coordinates for map over the continental US
-              zoom: 4
-            });
+        if (!isPlatformBrowser(this.platformId)) {
+            return;
         }
 
-        
-        this.map.on('load', () => {
+        const map = await this.mapService.initMap(this.mapContainer.nativeElement, this.basemapUrl);
+
+        map.on('load', () => {
             const dataSubscription1 = this.elementDataService.getElementData(config.layer1).pipe(
                 switchMap(data => {
-                    return this.processLayerData(data, 'layer1', this.layer1Title, this.animateLines1, this.pointType1, this.fillPolygons1);
+                    return this.processLayerData(data, 'layer1', this.layer1Title, this.animateLines1, this.pointType1, this.fillPolygons1, this.clusterPoints);
                 })
             ).subscribe();
             const dataSubscription2 = this.elementDataService.getElementData(config.layer2).pipe(
                 switchMap(data => {
-                    return this.processLayerData(data, 'layer2', this.layer2Title, this.animateLines2, this.pointType2, this.fillPolygons2);
+                    return this.processLayerData(data, 'layer2', this.layer2Title, this.animateLines2, this.pointType2, this.fillPolygons2, this.clusterPoints);
                 })
             ).subscribe();
             const dataSubscription3 = this.elementDataService.getElementData(config.layer3).pipe(
                 switchMap(data => {
-                    return this.processLayerData(data, 'layer3', this.layer3Title, this.animateLines3, this.pointType3, this.fillPolygons3);
+                    return this.processLayerData(data, 'layer3', this.layer3Title, this.animateLines3, this.pointType3, this.fillPolygons3, this.clusterPoints);
                 })
             ).subscribe();
             const dataSubscription4 = this.elementDataService.getElementData(config.layer4).pipe(
                 switchMap(data => {
-                    return this.processLayerData(data, 'layer4', this.layer4Title, this.animateLines4, this.pointType4, this.fillPolygons4);
+                    return this.processLayerData(data, 'layer4', this.layer4Title, this.animateLines4, this.pointType4, this.fillPolygons4, this.clusterPoints);
                 })
             ).subscribe();
             const legendSubscription = this.elementDataService.getElementData(config.legend).pipe(
@@ -721,71 +396,32 @@ export class MainComponent implements OnInit, AfterViewInit, OnDestroy {
             this.subscriptions.push(dataSubscription1, dataSubscription2, dataSubscription3, dataSubscription4, legendSubscription);
 
             // add click handler on map to hide tooltip when clicking on empty areas
-            this.map.on('click', (e: any) => {
-                // hide tooltip when clicking on empty areas (no features)
+            map.on('click', () => {
                 this.hideTooltip();
             });
 
-            // start animation for all dashed layers
-            this.animateDashArray(0);
-
+            this.mapService.animateDashArray();
         });
 
     }
 
-    private clearMapLayers(): void {
-        // remove existing route-related sources and layers
-        const style = this.map.getStyle();
-        
-        if (style && style.layers) {
-            // remove layers first
-            style.layers.forEach((layer: any) => {
-                if (layer.id.startsWith('line-background-') || layer.id.startsWith('line-dashed-')) {
-                    if (this.map.getLayer(layer.id)) {
-                        this.map.removeLayer(layer.id);
-                    }
-                }
-            });
+    private toBoolean(value: any, fallback: boolean = false): boolean {
+        if (value === undefined || value === null) {
+            return fallback;
         }
-        
-        if (style && style.sources) {
-            // remove sources
-            Object.keys(style.sources).forEach((sourceId: string) => {
-                if (sourceId.startsWith('route-')) {
-                    if (this.map.getSource(sourceId)) {
-                        this.map.removeSource(sourceId);
-                    }
-                }
-            });
+        if (typeof value === 'boolean') {
+            return value;
         }
-        
-        this.activeDashedLayerIds = [];
-        this.addedLayers = [];
-        this.layersWithClickHandlers.clear();
-    }
-
-    animateDashArray(timestamp: number) {
-        // Update line-dasharray for all active dashed layers
-        const newStep = Math.floor(
-            (timestamp / 50) % this.dashArraySequence.length
-        );
-
-        if (newStep !== this.step) {
-            // Update all dashed layers
-            this.activeDashedLayerIds.forEach(layerId => {
-                if (this.map.getLayer(layerId)) {
-                    this.map.setPaintProperty(
-                        layerId,
-                        'line-dasharray',
-                        this.dashArraySequence[this.step]
-                    );
-                }
-            });
-            this.step = newStep;
+        if (typeof value === 'string') {
+            const normalized = value.trim().toLowerCase();
+            if (normalized === 'true') {
+                return true;
+            }
+            if (normalized === 'false') {
+                return false;
+            }
         }
-
-        // Request the next frame of the animation.
-        requestAnimationFrame(this.animateDashArray.bind(this));
+        return Boolean(value);
     }
 
     toggleMainMenu() {
@@ -799,13 +435,7 @@ export class MainComponent implements OnInit, AfterViewInit, OnDestroy {
     ngOnDestroy(): void {
 
         this.subscriptions.forEach((subscription) => subscription.unsubscribe());
-
-        if (this.map) {
-            this.map.remove();
-        }
-
-        // clear click handler tracking
-        this.layersWithClickHandlers.clear();
+        this.mapService.dispose();
 
     }
 
